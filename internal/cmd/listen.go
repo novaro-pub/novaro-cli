@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -63,9 +65,21 @@ restarts; verify PSP-Signature with it as you would an endpoint's.
 			if latest {
 				apiVersion = "latest"
 			}
+			// Login's key is the one whose last secret the profile keeps.
+			fromLogin := a.apiKey == ""
+			if printSecret && fromLogin {
+				// A listen opened only to read the secret would replace
+				// the session of a listen already running on this machine.
+				if store, err := a.loadStore(); err == nil {
+					if p, _, err := store.Load(); err == nil && p.ListenSecret != "" {
+						fmt.Fprintln(a.out, p.ListenSecret)
+						return nil
+					}
+				}
+			}
 			if device == "" && !strings.HasPrefix(c.Key, "rk_") {
-				if p, _, err := a.store.Load(); err == nil {
-					device = p.DeviceName
+				if h, err := os.Hostname(); err == nil {
+					device = truncate(h, 64)
 				}
 			}
 			cfg := listen.Config{
@@ -73,9 +87,17 @@ restarts; verify PSP-Signature with it as you would an endpoint's.
 				Events: splitList(events), APIVersion: apiVersion, DeviceName: device,
 				ForwardTo: fwd, Headers: h, SkipVerify: skipVerify, Once: printSecret,
 			}
-			var out listen.Output = &terminal{a: a, forwardTo: fwd, printSecret: printSecret}
+			keep := func(secret string) {
+				if !fromLogin {
+					return
+				}
+				if store, err := a.loadStore(); err == nil {
+					_ = store.SetListenSecret(secret)
+				}
+			}
+			var out listen.Output = &terminal{a: a, forwardTo: fwd, printSecret: printSecret, keep: keep}
 			if format == "json" {
-				out = &jsonLines{a: a, printSecret: printSecret}
+				out = &jsonLines{a: a, printSecret: printSecret, keep: keep}
 			}
 			return listen.Run(cmd.Context(), cfg, out)
 		},
@@ -87,7 +109,7 @@ restarts; verify PSP-Signature with it as you would an endpoint's.
 	f.BoolVarP(&latest, "latest", "l", false, "render events in the latest API version")
 	f.StringVarP(&headers, "headers", "H", "", `headers to add to each forwarded request: "Key: Value, Key2: Value2"`)
 	f.BoolVar(&skipVerify, "skip-verify", false, "accept any certificate of an https --forward-to")
-	f.BoolVar(&printSecret, "print-secret", false, "print the signing secret and exit")
+	f.BoolVar(&printSecret, "print-secret", false, "print the signing secret and exit (the one listen last got with login's key; else it opens a session, which replaces a listen running with the same key)")
 	f.StringVar(&format, "format", "", "json: print each event as a line of JSON")
 	f.StringVar(&device, "device-name", "", "the machine's name, with a secret key (a CLI key has its own)")
 	return cmd
@@ -108,22 +130,44 @@ func forwardURL(s string) (string, error) {
 	return u.String(), nil
 }
 
+// parseHeaders reads "Key: Value, Key2: Value2": a comma starts another
+// header only where a name and a colon follow it, so a value may hold
+// commas (Accept: a, b). The delivery's own headers, PSP-* and
+// Content-Type, are not replaced.
 func parseHeaders(s string) (http.Header, error) {
 	h := http.Header{}
+	var parts []string
 	for part := range strings.SplitSeq(s, ",") {
+		name, _, ok := strings.Cut(part, ":")
+		if len(parts) > 0 && (!ok || !headerName.MatchString(strings.TrimSpace(name))) {
+			parts[len(parts)-1] += "," + part
+			continue
+		}
+		parts = append(parts, part)
+	}
+	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
 		k, v, ok := strings.Cut(part, ":")
-		k = strings.TrimSpace(k)
-		if !ok || k == "" {
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if !ok || !headerName.MatchString(k) {
 			return nil, fmt.Errorf("--headers %q: want Key: Value", part)
 		}
-		h.Add(k, strings.TrimSpace(v))
+		if strings.ContainsAny(v, "\r\n\x00") {
+			return nil, fmt.Errorf("--headers %q: a value is one line", k)
+		}
+		if ck := http.CanonicalHeaderKey(k); ck == "Content-Type" || strings.HasPrefix(ck, "Psp-") {
+			return nil, fmt.Errorf("--headers %q: the delivery's own header, as it was signed", k)
+		}
+		h.Add(k, v)
 	}
 	return h, nil
 }
+
+// headerName is an HTTP header's name (RFC 9110's token).
+var headerName = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 func splitList(in []string) []string {
 	var out []string
@@ -140,12 +184,14 @@ type terminal struct {
 	a           *app
 	forwardTo   string
 	printSecret bool
+	keep        func(secret string)
 	mu          sync.Mutex
 }
 
 func (t *terminal) Ready(r listen.Ready) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.keep(r.Secret)
 	if t.printSecret {
 		fmt.Fprintln(t.a.out, r.Secret)
 		return
@@ -178,12 +224,14 @@ func (t *terminal) Reconnecting(err error, wait time.Duration) {
 type jsonLines struct {
 	a           *app
 	printSecret bool
+	keep        func(secret string)
 	mu          sync.Mutex
 }
 
 func (j *jsonLines) Ready(r listen.Ready) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.keep(r.Secret)
 	if j.printSecret {
 		fmt.Fprintln(j.a.out, r.Secret)
 		return
@@ -201,6 +249,13 @@ func (j *jsonLines) Event(e listen.Event) {
 		buf.Write(b)
 	}
 	fmt.Fprintln(j.a.out, buf.String())
+	if e.Forward {
+		if e.Result.Error != "" {
+			fmt.Fprintf(j.a.errOut, "%s [ERR] %s: %s\n", e.ID, e.Result.Error, e.Result.Detail)
+		} else {
+			fmt.Fprintf(j.a.errOut, "%s [%d]\n", e.ID, e.Result.Status)
+		}
+	}
 }
 
 func (j *jsonLines) Reconnecting(err error, wait time.Duration) {

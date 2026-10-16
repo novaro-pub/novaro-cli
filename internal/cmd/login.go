@@ -47,7 +47,8 @@ func (a *app) loginCmd() *cobra.Command {
 		Long: `login opens the merchant portal's "Allow CLI access" page. Once an admin or
 a developer of the account confirms it there, novaro gets a CLI key
 (rk_test_…): test mode only, for 90 days. The key is kept in the OS
-keychain.
+keychain, or, on a machine with none, in novaro's config file, readable by
+you alone (login says which).
 
 With --api-key, login keeps that key instead and opens no browser: for CI.`,
 		Args: cobra.NoArgs,
@@ -74,18 +75,26 @@ func (a *app) saveKey() error {
 	if mode == "live" {
 		return errors.New("login keeps test keys only; pass a live key to each command with --api-key instead")
 	}
-	p := config.Profile{APIBase: a.base(config.Profile{}), Market: keyMarket, KeyPrefix: prefixOf(a.apiKey)}
+	base := a.base(config.Profile{})
+	if err := checkBase(base); err != nil {
+		return err
+	}
+	p := config.Profile{APIBase: base, Market: keyMarket, KeyPrefix: prefixOf(a.apiKey)}
 	return a.save(p, a.apiKey)
 }
 
 func (a *app) save(p config.Profile, key string) error {
-	inFile, err := a.store.Save(p, key)
+	store, err := a.loadStore()
+	if err != nil {
+		return err
+	}
+	inFile, err := store.Save(p, key)
 	if err != nil {
 		return err
 	}
 	where := "the OS keychain"
 	if inFile {
-		where = a.store.Path + " (no OS keychain answered)"
+		where = store.Path + ", readable by you alone (no OS keychain answered)"
 	}
 	fmt.Fprintf(a.out, "Done. The key %s… is kept in %s.\n", p.KeyPrefix, where)
 	return nil
@@ -103,7 +112,13 @@ func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) e
 		device = h
 	}
 	device = truncate(device, 64)
+	if _, err := a.loadStore(); err != nil {
+		return err
+	}
 	base := a.base(config.Profile{})
+	if err := checkBase(base); err != nil {
+		return err
+	}
 	c := &api.Client{Base: base, UserAgent: a.userAgent(), HTTPClient: a.httpClient}
 	var pr pairing
 	if err := c.Do(ctx, http.MethodPost, "/cli/pairings/"+url.PathEscape(market), nil, nil,
@@ -112,14 +127,18 @@ func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) e
 	}
 	fmt.Fprintf(a.out, "Your pairing code is: %s\n", pr.Code)
 	fmt.Fprintln(a.out, "It confirms you are pairing this machine. Check that the portal shows the same code.")
-	if noBrowser || openBrowser(ctx, pr.URL) != nil {
+	if noBrowser || !safeLink(pr.URL) || openBrowser(ctx, pr.URL) != nil {
 		fmt.Fprintf(a.out, "Open this link to allow access: %s\n", pr.URL)
 	} else {
 		fmt.Fprintf(a.out, "Opened %s in your browser.\n", pr.URL)
 	}
 	fmt.Fprintln(a.out, "Waiting for confirmation…")
 
-	deadline := time.Unix(pr.ExpiresAt, 0)
+	// The pairing lives 10 minutes; a start that names no end gets those.
+	deadline := a.now().Add(10 * time.Minute)
+	if pr.ExpiresAt > 0 {
+		deadline = time.Unix(pr.ExpiresAt, 0)
+	}
 	path := "/cli/pairings/" + url.PathEscape(market) + "/" + url.PathEscape(pr.ID) + "/poll"
 	t := time.NewTicker(pollEvery)
 	defer t.Stop()
@@ -133,15 +152,15 @@ func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) e
 		err := c.Do(ctx, http.MethodPost, path, nil, nil, map[string]string{"poll_secret": pr.PollSecret}, &poll)
 		var apiErr *api.Error
 		switch {
-		case errors.As(err, &apiErr) && apiErr.Status == http.StatusTooManyRequests:
-			continue
 		case errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound:
 			return errors.New("the pairing ended before it was confirmed: run novaro login again")
 		case err != nil:
+			// Polled too often (429) or the network: the next poll may
+			// pass, until the pairing ends.
 			if a.now().After(deadline) {
 				return fmt.Errorf("confirm pairing: %w", err)
 			}
-			continue // a network error: the next poll may pass
+			continue
 		}
 		if poll.Status == "confirmed" && poll.APIKey != "" {
 			p := config.Profile{APIBase: base, Market: market, DeviceName: device, KeyPrefix: poll.KeyPrefix, KeyExpiresAt: poll.KeyExpiresAt}
@@ -171,7 +190,11 @@ itself stays valid until it expires or is expired in the portal
 (Developers › API keys › CLI keys).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := a.store.Clear(); err != nil {
+			store, err := a.loadStore()
+			if err != nil {
+				return err
+			}
+			if err := store.Clear(); err != nil {
 				return err
 			}
 			fmt.Fprintln(a.out, "Logged out. Expire the key in the portal to stop it working anywhere.")
@@ -196,6 +219,23 @@ func truncate(s string, n int) string {
 		s = s[:len(s)-size]
 	}
 	return s
+}
+
+// safeLink says whether login may open u: the portal's page over https, or
+// over http on this machine as a local stack has it; never a file, a path
+// or another program's scheme a server could name.
+func safeLink(u string) bool {
+	l, err := url.Parse(u)
+	if err != nil || l.Host == "" {
+		return false
+	}
+	switch l.Scheme {
+	case "https":
+		return true
+	case "http":
+		return loopback(l.Hostname())
+	}
+	return false
 }
 
 // openBrowser opens u in the default browser.

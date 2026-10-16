@@ -6,15 +6,11 @@
 #   NOVARO_API_BASE      the API's address the binary talks to by default
 #   HOMEBREW_TAP_OWNER   the owner of the homebrew-tap and scoop-bucket repos
 #   TAP_GITHUB_TOKEN     a token that may push to both
-# Binaries and checksums are signed with cosign, keyless, by the workflow's
-# identity.
+# checksums.txt, which names every archive and package, and the images
+# are signed with cosign, keyless, by the release workflow's identity.
 version: 2
 
 project_name: novaro
-
-before:
-  hooks:
-    - go mod tidy
 
 builds:
   - id: novaro
@@ -103,6 +99,11 @@ dockers_v2:
       org.opencontainers.image.source: https://github.com/{{ .Env.HOMEBREW_TAP_OWNER }}/novaro-cli
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.licenses: Apache-2.0
+
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    args: ["sign", "${artifact}", "--yes"]
 
 changelog:
   sort: asc

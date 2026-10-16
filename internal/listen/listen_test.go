@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 )
@@ -311,5 +312,89 @@ func TestSocketURL(t *testing.T) {
 	}
 	if _, err := SocketURL("ftp://x"); err == nil {
 		t.Error("ftp accepted")
+	}
+}
+
+// Ctrl-C ends listen with the context's error, after a close message the
+// relay reads, not a dropped socket.
+func TestCtrlCClosesTheSocket(t *testing.T) {
+	closed := make(chan websocket.StatusCode, 1)
+	r := &relay{t: t}
+	r.scripts = []func(context.Context, *websocket.Conn, message){
+		func(ctx context.Context, conn *websocket.Conn, _ message) {
+			_ = writeJSON(ctx, conn, message{Type: "ready", Secret: "whsec_1"})
+			_, _, err := conn.Read(ctx)
+			closed <- websocket.CloseStatus(err)
+		},
+	}
+	api := httptest.NewServer(r)
+	defer api.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	out := &readyThen{recorder: &recorder{}, then: cancel}
+	err := Run(ctx, Config{URL: socketOf(t, api), Key: "k"}, out)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v; want context.Canceled", err)
+	}
+	if code := <-closed; code != websocket.StatusNormalClosure {
+		t.Errorf("the relay read %v; want a normal close", code)
+	}
+}
+
+// readyThen calls then once the relay is ready.
+type readyThen struct {
+	*recorder
+	then func()
+}
+
+func (o *readyThen) Ready(r Ready) { o.recorder.Ready(r); o.then() }
+
+// A relay that goes quiet (no ping, no message) past pingGap is left, and
+// a new socket opened.
+func TestASilentRelayIsLeft(t *testing.T) {
+	pingGap, firstBackoff = 300*time.Millisecond, 10*time.Millisecond
+	defer func() { pingGap = 75 * time.Second }()
+	r := &relay{t: t}
+	r.scripts = []func(context.Context, *websocket.Conn, message){
+		func(ctx context.Context, conn *websocket.Conn, _ message) {
+			_ = writeJSON(ctx, conn, message{Type: "ready", Secret: "whsec_1"})
+			<-ctx.Done() // silent: no ping, no close
+		},
+		func(ctx context.Context, conn *websocket.Conn, _ message) {
+			_ = writeJSON(ctx, conn, message{Type: "ready", Secret: "whsec_1"})
+			_ = writeJSON(ctx, conn, message{Type: "error", Code: "session_replaced"})
+			_ = conn.Close(websocket.StatusPolicyViolation, "session_replaced")
+		},
+	}
+	api := httptest.NewServer(r)
+	defer api.Close()
+	out := &recorder{}
+	start := time.Now()
+	err := Run(t.Context(), Config{URL: socketOf(t, api), Key: "k"}, out)
+	var e *Error
+	if !errors.As(err, &e) || e.Code != "session_replaced" || len(out.retry) != 1 {
+		t.Fatalf("Run = %v, reconnects %v", err, out.retry)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("left the silent relay after %s", d)
+	}
+}
+
+func TestClip(t *testing.T) {
+	euro := strings.Repeat("€", 1000) // 3000 bytes, 2048 inside a character
+	if got := clip([]byte(euro), 2048); len(got) > 2048 || !utf8.ValidString(got) || len(got) != 2046 {
+		t.Errorf("3-byte characters: %d bytes, valid %v", len(got), utf8.ValidString(got))
+	}
+	bin := make([]byte, 2048)
+	for i := range bin {
+		bin[i] = 0xff
+	}
+	if got := clip(bin, 2048); len(got) > 2048 || !utf8.ValidString(got) {
+		t.Errorf("binary: %d bytes, valid %v", len(got), utf8.ValidString(got))
+	}
+	if b, _ := json.Marshal(clip(bin, 2048)); len(b) > 2048+2 {
+		t.Errorf("binary as JSON: %d bytes", len(b))
+	}
+	if got := clip([]byte("ok"), 2048); got != "ok" {
+		t.Errorf("%q", got)
 	}
 }

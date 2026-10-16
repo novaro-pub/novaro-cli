@@ -18,7 +18,7 @@ novaro trigger payment.succeeded
 - **Docker:** `docker run --rm -it ghcr.io/novaro/novaro version`
 - **Any system:** the archive for it from the releases page
 
-Every release's `checksums.txt` is signed with [cosign](https://github.com/sigstore/cosign), keyless:
+Every release's `checksums.txt`, which names every archive and package, is signed with [cosign](https://github.com/sigstore/cosign), keyless:
 
 ```sh
 cosign verify-blob --bundle checksums.txt.sigstore.json \
@@ -30,15 +30,16 @@ cosign verify-blob --bundle checksums.txt.sigstore.json \
 
 | Command | What it does |
 | --- | --- |
-| `novaro login` | Pairs novaro with your account in the browser: someone of the account allows it in the merchant portal, and novaro gets a CLI key (`rk_test_…`, test mode, 90 days), kept in the OS keychain. `--api-key sk_test_…` keeps that key instead, for CI. |
+| `novaro login` | Pairs novaro with your account in the browser: someone of the account allows it in the merchant portal, and novaro gets a CLI key (`rk_test_…`, test mode, 90 days), kept in the OS keychain, or, on a machine with none, in novaro's config file, readable by you alone. `--api-key sk_test_…` keeps that key instead, for CI. The key is sent only to the address login used, over https (or http to this machine). |
 | `novaro logout` | Forgets the key on this machine. |
-| `novaro listen` | Receives your test-mode events and POSTs each to `--forward-to`, signed as your endpoints' are; your server's answer is the delivery's attempt. `--events`, `--api-version`, `--latest`, `--headers`, `--skip-verify`, `--print-secret`, `--format json`. |
+| `novaro listen` | Receives your test-mode events and POSTs each to `--forward-to`, signed as your endpoints' are; your server's answer is the delivery's attempt. `--events`, `--api-version`, `--latest`, `--headers`, `--skip-verify`, `--print-secret` (the secret listen last got, without opening a session), `--format json`. |
 | `novaro trigger <event>` | Makes the event happen with a test payment and a magic UTR. `--list`, `--override field=value`. |
 | `novaro events list\|retrieve\|resend` | Reads your events (`GET /events`) and resends one to an endpoint (`POST /events/{id}/retry`). `--live` with `--api-key sk_live_…` for live mode. |
 | `novaro version`, `novaro completion` | The version; shell completion for bash, zsh, fish and PowerShell. |
 
-Every command takes `--api-key` and `--api-base`; `NOVARO_API_BASE` sets the
-API's address, and `NOVARO_CONFIG_DIR` where the config lives.
+Every command takes `--api-key` (or `NOVARO_API_KEY`, which stays out of
+your shell history) and `--api-base`; `NOVARO_API_BASE` sets the API's
+address, and `NOVARO_CONFIG_DIR` where the config lives.
 
 ## Develop
 

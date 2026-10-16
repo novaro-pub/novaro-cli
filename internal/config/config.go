@@ -15,8 +15,13 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
-// keyringService names novaro's entries in the OS keychain.
-const keyringService = "novaro"
+const (
+	// keyringService and keyringUser name novaro's one entry in the OS
+	// keychain: one login at a time, so a login against another API
+	// address replaces the key rather than leaving the old one behind.
+	keyringService = "novaro"
+	keyringUser    = "api-key"
+)
 
 // Profile is the config file's content.
 type Profile struct {
@@ -28,6 +33,10 @@ type Profile struct {
 	KeyExpiresAt int64 `json:"key_expires_at,omitempty"`
 	// Key is set only when no keychain took it.
 	Key string `json:"key,omitempty"`
+	// ListenSecret is the signing secret novaro listen last got with this
+	// login's key: what listen --print-secret prints without opening a
+	// session, which would replace a running listen's.
+	ListenSecret string `json:"listen_secret,omitempty"`
 }
 
 // Store reads and writes the profile and its key.
@@ -58,7 +67,7 @@ func Default() (*Store, error) {
 	if dir == "" {
 		base, err := os.UserConfigDir()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("no config directory (set NOVARO_CONFIG_DIR): %w", err)
 		}
 		dir = filepath.Join(base, "novaro")
 	}
@@ -68,23 +77,32 @@ func Default() (*Store, error) {
 // ErrNotLoggedIn is Load's answer when login has not run.
 var ErrNotLoggedIn = errors.New("not logged in: run novaro login, or pass --api-key")
 
-// Load reads the profile and its key.
-func (s *Store) Load() (Profile, string, error) {
+// readProfile reads the config file alone.
+func (s *Store) readProfile() (Profile, error) {
 	b, err := os.ReadFile(s.Path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return Profile{}, "", ErrNotLoggedIn
+		return Profile{}, ErrNotLoggedIn
 	}
 	if err != nil {
-		return Profile{}, "", err
+		return Profile{}, err
 	}
 	var p Profile
 	if err := json.Unmarshal(b, &p); err != nil {
-		return Profile{}, "", fmt.Errorf("%s: %w", s.Path, err)
+		return Profile{}, fmt.Errorf("%s: %w (novaro logout removes it)", s.Path, err)
+	}
+	return p, nil
+}
+
+// Load reads the profile and its key.
+func (s *Store) Load() (Profile, string, error) {
+	p, err := s.readProfile()
+	if err != nil {
+		return Profile{}, "", err
 	}
 	if p.Key != "" {
 		return p, p.Key, nil
 	}
-	key, err := s.Keyring.Get(keyringService, p.APIBase)
+	key, err := s.Keyring.Get(keyringService, keyringUser)
 	if errors.Is(err, keyring.ErrNotFound) {
 		return p, "", ErrNotLoggedIn
 	}
@@ -95,43 +113,87 @@ func (s *Store) Load() (Profile, string, error) {
 }
 
 // Save writes p and key: key to the keychain, or into the file when the
-// keychain refuses it (a server without one); fallback says which.
+// keychain refuses it (a server without one); inFile says which. A file
+// that cannot be written takes the key back out of the keychain.
 func (s *Store) Save(p Profile, key string) (inFile bool, err error) {
 	p.Key = ""
-	if err := s.Keyring.Set(keyringService, p.APIBase, key); err != nil {
+	if err := s.Keyring.Set(keyringService, keyringUser, key); err != nil {
 		p.Key = key
 		inFile = true
 	}
-	b, err := json.MarshalIndent(p, "", "  ")
-	if err != nil {
+	if err := s.write(p); err != nil {
+		if !inFile {
+			_ = s.Keyring.Delete(keyringService, keyringUser)
+		}
 		return false, err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return false, err
-	}
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
-		return false, err
-	}
-	return inFile, os.Rename(tmp, s.Path)
+	return inFile, nil
 }
 
-// Clear removes the key and the profile. Neither being there is not an
-// error.
-func (s *Store) Clear() error {
-	p, _, err := s.Load()
-	if err != nil && !errors.Is(err, ErrNotLoggedIn) {
+// SetListenSecret keeps the signing secret listen got, in the profile of
+// login's key.
+func (s *Store) SetListenSecret(secret string) error {
+	p, err := s.readProfile()
+	if err != nil {
 		return err
 	}
-	if p.APIBase != "" {
-		if err := s.Keyring.Delete(keyringService, p.APIBase); err != nil && !errors.Is(err, keyring.ErrNotFound) {
-			return fmt.Errorf("the OS keychain: %w", err)
-		}
+	if p.ListenSecret == secret {
+		return nil
 	}
+	p.ListenSecret = secret
+	return s.write(p)
+}
+
+// write replaces the file with p, 0600, whole: a new file renamed over it.
+func (s *Store) write(p Profile) error {
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(s.Path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".config-*.json")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(f.Name()) }()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), s.Path)
+}
+
+// Clear removes the key and the profile, whatever state they are in: the
+// file first, so a key kept in it is gone even where the keychain cannot be
+// reached. A keychain that cannot be reached is an error only when the key
+// may be in it. Neither being there is not an error.
+func (s *Store) Clear() error {
+	p, readErr := s.readProfile()
 	if err := os.Remove(s.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	return nil
+	err := s.Keyring.Delete(keyringService, keyringUser)
+	if err == nil || errors.Is(err, keyring.ErrNotFound) {
+		return nil
+	}
+	if readErr == nil && p.Key != "" {
+		// The key was in the file: no keychain took it.
+		return nil
+	}
+	if errors.Is(readErr, ErrNotLoggedIn) {
+		return nil
+	}
+	return fmt.Errorf("the OS keychain: %w", err)
 }
 
 // Expired says whether p's key has expired at now.

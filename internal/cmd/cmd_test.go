@@ -43,6 +43,9 @@ func (k *fakeKeyring) Set(s, u, p string) error {
 func (k *fakeKeyring) Get(s, u string) (string, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if k.broken {
+		return "", errors.New("no keychain")
+	}
 	v, ok := k.m[s+"|"+u]
 	if !ok {
 		return "", keyring.ErrNotFound
@@ -53,6 +56,9 @@ func (k *fakeKeyring) Get(s, u string) (string, error) {
 func (k *fakeKeyring) Delete(s, u string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if k.broken {
+		return errors.New("no keychain")
+	}
 	if _, ok := k.m[s+"|"+u]; !ok {
 		return keyring.ErrNotFound
 	}
@@ -70,6 +76,7 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	t.Setenv("NOVARO_API_BASE", "")
+	t.Setenv("NOVARO_API_KEY", "")
 	kr := &fakeKeyring{m: map[string]string{}}
 	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
 	return &harness{
@@ -211,7 +218,7 @@ func TestLoginStopsWhenThePairingEnds(t *testing.T) {
 func TestLoginWithAKeyKeepsItInTheFileWhenNoKeychainTakesIt(t *testing.T) {
 	h := newHarness(t)
 	h.keyring.broken = true
-	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "http://x"); err != nil {
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://x"); err != nil {
 		t.Fatal(err)
 	}
 	p, key, err := h.a.store.Load()
@@ -240,7 +247,7 @@ func TestLoginRefusesALiveKey(t *testing.T) {
 
 func TestAnExpiredKeyAsksForLogin(t *testing.T) {
 	h := newHarness(t)
-	if _, err := h.a.store.Save(config.Profile{APIBase: "http://x", Market: "in", KeyPrefix: "rk_test_in_AAAAAAAA", KeyExpiresAt: time.Now().Add(-time.Hour).Unix()}, "rk_test_in_AAAAAAAAzz"); err != nil {
+	if _, err := h.a.store.Save(config.Profile{APIBase: "https://x", Market: "in", KeyPrefix: "rk_test_in_AAAAAAAA", KeyExpiresAt: time.Now().Add(-time.Hour).Unix()}, "rk_test_in_AAAAAAAAzz"); err != nil {
 		t.Fatal(err)
 	}
 	err := h.run(t, "events", "list")
@@ -350,7 +357,7 @@ func TestEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := f.all()[2]
-	if last.Method != http.MethodPost || last.Body["webhook_endpoint"] != "whe_in_1" || last.Header.Get("Idempotency-Key") == "" {
+	if last.Method != http.MethodPost || last.Body["webhook_endpoint"] != "whe_in_1" || last.Header.Get("Idempotency-Key") != "" {
 		t.Errorf("resend %+v", last)
 	}
 	err := h.run(t, append([]string{"events", "retrieve", "evt_in_2"}, base...)...)
@@ -360,7 +367,7 @@ func TestEvents(t *testing.T) {
 	if err := h.run(t, "events", "list", "--live", "--api-key", testKey); err == nil || !strings.Contains(err.Error(), "sk_live_") {
 		t.Errorf("--live with a test key: %v", err)
 	}
-	if err := h.run(t, "events", "list", "--api-key", "sk_live_in_0123456789abcdef"); err == nil || !strings.Contains(err.Error(), "test mode only") {
+	if err := h.run(t, "events", "list", "--api-key", "sk_live_in_0123456789abcdef"); err == nil || !strings.Contains(err.Error(), "add --live") {
 		t.Errorf("a live key without --live: %v", err)
 	}
 }
@@ -372,5 +379,165 @@ func TestVersion(t *testing.T) {
 	}
 	if got := h.out.String(); got != "novaro version 1.2.3 (commit abc, built today)\n" {
 		t.Errorf("%q", got)
+	}
+}
+
+// Where no keychain answers, logout still removes the key, which is in the
+// file, and says nothing went wrong; a broken file is removed too.
+func TestLogoutWithoutAKeychain(t *testing.T) {
+	h := newHarness(t)
+	h.keyring.broken = true
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.run(t, "logout"); err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	if _, err := os.Stat(h.a.store.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the file with the key is still there: %v", err)
+	}
+	h.keyring.broken = false
+	if err := os.MkdirAll(filepath.Dir(h.a.store.Path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.a.store.Path, []byte("{nonsense"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.run(t, "logout"); err != nil {
+		t.Fatalf("logout of a broken file: %v", err)
+	}
+	if _, err := os.Stat(h.a.store.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the broken file is still there: %v", err)
+	}
+}
+
+// A second login replaces the key in the keychain, whatever its address:
+// one entry, never an orphan of the first.
+func TestASecondLoginReplacesTheKey(t *testing.T) {
+	h := newHarness(t)
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://a"); err != nil {
+		t.Fatal(err)
+	}
+	other := "rk_test_in_ZYXWVUTSrest"
+	if err := h.run(t, "login", "--api-key", other, "--api-base", "https://b"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.keyring.m) != 1 {
+		t.Fatalf("keychain %v; want one entry", h.keyring.m)
+	}
+	if _, key, err := h.a.store.Load(); err != nil || key != other {
+		t.Fatalf("Load = %q, %v", key, err)
+	}
+}
+
+// Login's key goes to login's address alone, and no key goes over plain
+// http but to this machine.
+func TestTheKeyGoesToItsAddressOnly(t *testing.T) {
+	h := newHarness(t)
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://api.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	err := h.run(t, "events", "list", "--api-base", "https://evil.example.com")
+	if err == nil || !strings.Contains(err.Error(), "login's key is for https://api.example.com") {
+		t.Errorf("another --api-base: %v", err)
+	}
+	t.Setenv("NOVARO_API_BASE", "http://localhost:28081")
+	if err := h.run(t, "events", "list"); err == nil || !strings.Contains(err.Error(), "login's key is for") {
+		t.Errorf("another $NOVARO_API_BASE: %v", err)
+	}
+	t.Setenv("NOVARO_API_BASE", "")
+	for base, want := range map[string]string{"http://api.example.com": "plain http", "ftp://x": "not http(s)", "nonsense": "not a URL"} {
+		if err := h.run(t, "events", "list", "--api-key", testKey, "--api-base", base); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v; want %q", base, err, want)
+		}
+	}
+	for _, base := range []string{"http://localhost:1", "http://127.0.0.1:1", "http://api.localhost:1", "http://[::1]:1"} {
+		if err := checkBase(base); err != nil {
+			t.Errorf("%s: %v", base, err)
+		}
+	}
+}
+
+func TestSafeLink(t *testing.T) {
+	for link, want := range map[string]bool{
+		"https://portal.example.com/cli/pair?code=A": true,
+		"http://portal.localhost:5173/cli/pair":      true,
+		"http://portal.example.com/cli/pair":         false,
+		"file:///etc/passwd":                         false,
+		`C:\Windows\x.exe`:                           false,
+		"/Applications/Calculator.app":               false,
+		"javascript:alert(1)":                        false,
+	} {
+		if got := safeLink(link); got != want {
+			t.Errorf("safeLink(%q) = %v", link, got)
+		}
+	}
+}
+
+func TestNovaroAPIKey(t *testing.T) {
+	h := newHarness(t)
+	var f fakeAPI
+	s := f.server(t, func(request) (int, any) {
+		return http.StatusOK, map[string]any{"object": "list", "data": []any{}}
+	})
+	t.Setenv("NOVARO_API_KEY", testKey)
+	if err := h.run(t, "events", "list", "--api-base", s.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.all()[0].Header.Get("Authorization"); got != "Bearer "+testKey {
+		t.Errorf("Authorization %q", got)
+	}
+	h.out.Reset()
+	if err := h.run(t, "--help"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(h.out.String(), testKey) {
+		t.Error("--help printed the key")
+	}
+}
+
+// version needs no config directory.
+func TestVersionWithoutAConfigDirectory(t *testing.T) {
+	h := newHarness(t)
+	h.a.store, h.a.storeErr = nil, errors.New("no config directory")
+	if err := h.run(t, "version"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.run(t, "logout"); err == nil {
+		t.Error("logout without a config directory passed")
+	}
+}
+
+func TestParseHeaders(t *testing.T) {
+	h, err := parseHeaders("Accept: a, b, X-Trace: 1,Host: local.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Get("Accept") != "a, b" || h.Get("X-Trace") != "1" || h.Get("Host") != "local.test" {
+		t.Errorf("%v", h)
+	}
+	for _, bad := range []string{"nocolon", "Bad Name: x", "PSP-Signature: t=1", "Content-Type: text/plain", "X: a\rb"} {
+		if _, err := parseHeaders(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// --print-secret prints the secret listen last got with login's key and
+// opens no session, which would replace a running listen's.
+func TestPrintSecretReadsTheLastOne(t *testing.T) {
+	h := newHarness(t)
+	if err := h.run(t, "login", "--api-key", "rk_test_in_ABCDEFGHrest", "--api-base", "https://unreachable.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.store.SetListenSecret("whsec_kept"); err != nil {
+		t.Fatal(err)
+	}
+	h.out.Reset()
+	if err := h.run(t, "listen", "--print-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.out.String(); got != "whsec_kept\n" {
+		t.Errorf("printed %q", got)
 	}
 }

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -36,7 +38,10 @@ type app struct {
 	out    io.Writer
 	errOut io.Writer
 	store  *config.Store
-	now    func() time.Time
+	// storeErr is why there is no store: no config directory. Only the
+	// commands that read or write it fail on it.
+	storeErr error
+	now      func() time.Time
 	// httpClient is the API's; tests replace it.
 	httpClient *http.Client
 
@@ -49,12 +54,8 @@ type app struct {
 func Execute(b Build) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	store, err := config.Default()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "novaro:", err)
-		return 1
-	}
-	a := &app{build: b, out: os.Stdout, errOut: os.Stderr, store: store, now: time.Now}
+	store, storeErr := config.Default()
+	a := &app{build: b, out: os.Stdout, errOut: os.Stderr, store: store, storeErr: storeErr, now: time.Now}
 	root := a.root()
 	root.SetArgs(os.Args[1:])
 	if err := root.ExecuteContext(ctx); err != nil {
@@ -83,7 +84,14 @@ Start with: novaro login`,
 	root.SetErr(a.errOut)
 	root.SetVersionTemplate("novaro version {{.Version}}\n")
 	pf := root.PersistentFlags()
-	pf.StringVar(&a.apiKey, "api-key", "", "use this key instead of login's (sk_test_…, sk_live_… or rk_test_…)")
+	// $NOVARO_API_KEY is read when the command runs, not as the flag's
+	// default: --help prints defaults.
+	pf.StringVar(&a.apiKey, "api-key", "", "use this key instead of login's (sk_test_…, sk_live_… or rk_test_…; or $NOVARO_API_KEY)")
+	root.PersistentPreRun = func(*cobra.Command, []string) {
+		if a.apiKey == "" {
+			a.apiKey = os.Getenv("NOVARO_API_KEY")
+		}
+	}
 	pf.StringVar(&a.apiBase, "api-base", "", "the API's address (default: login's, or $NOVARO_API_BASE)")
 	root.AddCommand(a.loginCmd(), a.logoutCmd(), a.listenCmd(), a.triggerCmd(), a.eventsCmd(), a.versionCmd())
 	return root
@@ -113,26 +121,79 @@ func (a *app) base(p config.Profile) string {
 	return ""
 }
 
+// checkBase refuses an address a key must not be sent to: one that is not
+// http(s), or plain http to anything but this machine.
+func checkBase(base string) error {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("the API's address %q is not a URL", base)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if loopback(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("the API's address %q is plain http: only https, or http to this machine", base)
+	}
+	return fmt.Errorf("the API's address %q is not http(s)", base)
+}
+
+func loopback(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// loadStore is the store, or why there is none.
+func (a *app) loadStore() (*config.Store, error) {
+	if a.storeErr != nil {
+		return nil, a.storeErr
+	}
+	return a.store, nil
+}
+
 // client is the API client with the key a command uses: --api-key, or
-// login's. live says whether the command may use a live key.
+// login's. live says whether the command may use a live key. Login's key
+// goes to login's address only: another --api-base or $NOVARO_API_BASE
+// needs a key of its own.
 func (a *app) client(live bool) (*api.Client, error) {
 	key := a.apiKey
 	var p config.Profile
+	base := ""
 	if key == "" {
-		var err error
-		if p, key, err = a.store.Load(); err != nil {
+		store, err := a.loadStore()
+		if err != nil {
+			return nil, err
+		}
+		if p, key, err = store.Load(); err != nil {
 			return nil, err
 		}
 		if p.Expired(a.now()) {
 			return nil, fmt.Errorf("the key %s… expired on %s: run novaro login again", p.KeyPrefix, time.Unix(p.KeyExpiresAt, 0).Format(time.DateOnly))
 		}
-	} else if mode, _, ok := keyParts(key); !ok {
-		return nil, errors.New("--api-key is not an API key: it starts sk_test_, sk_live_ or rk_test_")
-	} else if mode == "live" && !live {
-		return nil, errors.New("this command works in test mode only: pass a test key (sk_test_… or rk_test_…)")
+		base = a.base(p)
+		if p.APIBase != "" && base != strings.TrimRight(p.APIBase, "/") {
+			return nil, fmt.Errorf("login's key is for %s, not %s: pass --api-key for it, or run novaro login against it", p.APIBase, base)
+		}
+	} else {
+		mode, _, ok := keyParts(key)
+		if !ok {
+			return nil, errors.New("--api-key is not an API key: it starts sk_test_, sk_live_ or rk_test_")
+		}
+		if mode == "live" && !live {
+			return nil, errors.New("this command works in test mode only: pass a test key (sk_test_… or rk_test_…)")
+		}
+		base = a.base(config.Profile{})
+	}
+	if err := checkBase(base); err != nil {
+		return nil, err
 	}
 	return &api.Client{
-		Base:       a.base(p),
+		Base:       base,
 		Key:        key,
 		UserAgent:  a.userAgent(),
 		HTTPClient: a.httpClient,

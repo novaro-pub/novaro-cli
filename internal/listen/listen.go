@@ -25,7 +25,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 )
@@ -37,6 +39,10 @@ var forwardWait = 10 * time.Second
 // firstBackoff is the first wait before a new socket. Tests shorten it.
 var firstBackoff = time.Second
 
+// pingGap is how long a socket may go without a ping or a message from
+// the relay, which pings every 30 s. Tests shorten it.
+var pingGap = 75 * time.Second
+
 const (
 	// bodyLimit is how much of the answer goes back: the relay keeps 2 KB.
 	bodyLimit = 2048
@@ -44,6 +50,8 @@ const (
 	readyWait = 20 * time.Second
 	// maxBackoff bounds the wait between reconnects.
 	maxBackoff = 30 * time.Second
+	// maxForwards bounds the events forwarded at once.
+	maxForwards = 16
 )
 
 // message is every message of the protocol.
@@ -148,8 +156,8 @@ func (e *Error) final() bool {
 	return true
 }
 
-// Run listens until ctx ends or the relay ends it for good. A dropped
-// socket, a stopping pod or a stale session open a new one.
+// Run listens until ctx ends (its error) or the relay ends it for good. A
+// dropped socket, a stopping pod or a stale session open a new one.
 func Run(ctx context.Context, cfg Config, out Output) error {
 	fwd := &http.Client{
 		Timeout: forwardWait,
@@ -164,7 +172,7 @@ func Run(ctx context.Context, cfg Config, out Output) error {
 	for {
 		readied, err := session(ctx, cfg, fwd, out)
 		if ctx.Err() != nil {
-			return nil
+			return ctx.Err()
 		}
 		if err == nil { // Once
 			return nil
@@ -182,7 +190,7 @@ func Run(ctx context.Context, cfg Config, out Output) error {
 		out.Reconnecting(err, wait)
 		select {
 		case <-ctx.Done():
-			return nil
+			return ctx.Err()
 		case <-time.After(wait):
 		}
 		wait = min(wait*2, maxBackoff)
@@ -200,7 +208,10 @@ func session(ctx context.Context, cfg Config, fwd *http.Client, out Output) (rea
 	defer cancel()
 	// websocket.Dial closes the answer's body itself; a refusal's, which
 	// refusal reads, is a copy in memory.
-	conn, res, err := websocket.Dial(dctx, cfg.URL, &websocket.DialOptions{HTTPHeader: h}) //nolint:bodyclose // see above
+	var alive atomic.Value
+	alive.Store(time.Now())
+	conn, res, err := websocket.Dial(dctx, cfg.URL, &websocket.DialOptions{HTTPHeader: h, //nolint:bodyclose // see above
+		OnPingReceived: func(context.Context, []byte) bool { alive.Store(time.Now()); return true }})
 	if err != nil {
 		if res != nil {
 			return false, refusal(res)
@@ -230,29 +241,64 @@ func session(ctx context.Context, cfg Config, fwd *http.Client, out Output) (rea
 		return true, nil
 	}
 
+	// The socket is read under a context of its own: Ctrl-C (ctx) closes
+	// it with a close message, which ends the read, rather than dropping
+	// it. No ping from the relay for pingGap is a socket gone silently
+	// (a laptop asleep, a network changed): it is dropped, and a new one
+	// opened.
+	gap := pingGap
+	rctx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	watched := make(chan struct{})
+	defer func() { stop(); <-watched }()
+	go func() {
+		defer close(watched)
+		t := time.NewTicker(gap / 4)
+		defer t.Stop()
+		for {
+			select {
+			case <-rctx.Done():
+				return
+			case <-ctx.Done():
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+				return
+			case <-t.C:
+				if time.Since(alive.Load().(time.Time)) > gap {
+					_ = conn.CloseNow()
+					return
+				}
+			}
+		}
+	}()
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	sctx, stop := context.WithCancel(ctx)
-	defer stop()
+	busy := make(chan struct{}, maxForwards)
 	for {
-		m, err := read(sctx, conn)
+		m, err := read(rctx, conn)
 		if err != nil {
 			if ctx.Err() != nil {
-				_ = conn.Close(websocket.StatusNormalClosure, "")
+				return true, ctx.Err()
+			}
+			if time.Since(alive.Load().(time.Time)) > gap {
+				return true, &Error{Code: "socket_closed", Message: "no word from the relay for " + gap.String()}
 			}
 			return true, err
 		}
+		alive.Store(time.Now())
 		switch m.Type {
 		case "event":
+			select {
+			case busy <- struct{}{}:
+			case <-ctx.Done():
+				continue
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ev := forward(sctx, cfg, fwd, m)
-				if err := write(sctx, conn, message{Type: "result", ID: m.ID, Status: ev.Result.Status,
-					DurationMs: ev.Result.Duration.Milliseconds(), Body: ev.Result.Body, Error: ev.Result.Error}); err != nil {
-					return
-				}
+				defer func() { <-busy }()
+				ev := forward(ctx, cfg, fwd, m)
 				out.Event(ev)
+				_ = write(rctx, conn, message{Type: "result", ID: m.ID, Status: ev.Result.Status,
+					DurationMs: ev.Result.Duration.Milliseconds(), Body: ev.Result.Body, Error: ev.Result.Error})
 			}()
 		case "error":
 			return true, &Error{Code: m.Code, Message: m.Message}
@@ -286,6 +332,10 @@ func forward(ctx context.Context, cfg Config, c *http.Client, m message) Event {
 		req.Header.Set(k, v)
 	}
 	for k, vs := range cfg.Headers {
+		if http.CanonicalHeaderKey(k) == "Host" {
+			req.Host = vs[0]
+			continue
+		}
 		req.Header[http.CanonicalHeaderKey(k)] = vs
 	}
 	start := time.Now()
@@ -298,8 +348,21 @@ func forward(ctx context.Context, cfg Config, c *http.Client, m message) Event {
 	defer func() { _ = res.Body.Close() }()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, bodyLimit))
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
-	ev.Result.Status, ev.Result.Body = res.StatusCode, string(b)
+	ev.Result.Status, ev.Result.Body = res.StatusCode, clip(b, bodyLimit)
 	return ev
+}
+
+// clip is the body as the relay keeps it: valid UTF-8 (JSON would write
+// each invalid byte as three), at most n bytes, cut between characters.
+func clip(b []byte, n int) string {
+	s := strings.ToValidUTF8(string(b), "\uFFFD")
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // kind is the relay's name for a failed POST.

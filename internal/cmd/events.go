@@ -29,10 +29,12 @@ They are test-mode events unless you pass --live with a live secret key
 	}
 	cmd.PersistentFlags().BoolVar(&live, "live", false, "live-mode events: needs --api-key sk_live_…")
 	client := func() (*api.Client, error) {
-		if live {
-			if mode, _, ok := keyParts(a.apiKey); !ok || mode != "live" {
-				return nil, errors.New("--live needs a live secret key: --api-key sk_live_…")
-			}
+		mode, _, _ := keyParts(a.apiKey)
+		if live && mode != "live" {
+			return nil, errors.New("--live needs a live secret key: --api-key sk_live_…")
+		}
+		if !live && mode == "live" {
+			return nil, errors.New("a live key reads live mode's events: add --live")
 		}
 		return a.client(live)
 	}
@@ -100,7 +102,8 @@ as Resend in the portal. The endpoint must have been sent the event.`,
 				return err
 			}
 			body := map[string]string{"webhook_endpoint": endpoint}
-			return a.print(cmd.Context(), c, http.MethodPost, "/events/"+url.PathEscape(args[0])+"/retry", nil, idempotent(), body)
+			// A resend takes no Idempotency-Key: each one sends again.
+			return a.print(cmd.Context(), c, http.MethodPost, "/events/"+url.PathEscape(args[0])+"/retry", nil, nil, body)
 		},
 	}
 	resend.Flags().StringVar(&endpoint, "webhook-endpoint", "", "the endpoint to send it to (whe_…)")
