@@ -126,7 +126,8 @@ func names() []string {
 // overrides applied.
 func paymentBody(market string, overrides []string) (map[string]any, error) {
 	body := map[string]any{
-		"amount":              10000,
+		// ₹499: above the market's least for UPI (₹200 in India).
+		"amount":              49900,
 		"currency":            currencies[market],
 		"merchant_reference":  "novaro_trigger_" + randomHex(8),
 		"customer":            map[string]any{"id": "novaro_cli"},
