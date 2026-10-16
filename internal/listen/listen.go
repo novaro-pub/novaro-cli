@@ -264,8 +264,10 @@ func session(ctx context.Context, cfg Config, fwd *http.Client, out Output) (rea
 				return
 			case <-ctx.Done():
 				// A close message, which the relay answers at once; on a
-				// network gone, not more than a second of waiting for it.
-				t := time.AfterFunc(time.Second, func() { _ = conn.CloseNow() })
+				// network gone, not more than a second of waiting for it:
+				// then the read is cancelled, which drops the socket (a
+				// CloseNow after Close would only wait for Close).
+				t := time.AfterFunc(time.Second, stop)
 				_ = conn.Close(websocket.StatusNormalClosure, "")
 				t.Stop()
 				return

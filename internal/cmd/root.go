@@ -108,8 +108,8 @@ Start with: novaro login`,
 	// $NOVARO_API_KEY is read when the command runs, not as the flag's
 	// default: --help prints defaults.
 	pf.StringVar(&a.apiKey, "api-key", "", "use this key instead of login's (sk_test_…, sk_live_… or rk_test_…; or $NOVARO_API_KEY)")
-	root.PersistentPreRun = func(*cobra.Command, []string) {
-		if a.apiKey == "" {
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		if a.apiKey == "" && !cmd.Flags().Changed("api-key") {
 			a.apiKey = os.Getenv("NOVARO_API_KEY")
 		}
 	}

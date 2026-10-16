@@ -151,7 +151,8 @@ func (s *Store) SetListenSecret(keyPrefix, device, secret string) error {
 		return nil
 	}
 	p.ListenSecret, p.ListenKeyPrefix, p.ListenDevice = secret, keyPrefix, device
-	return s.write(p)
+	// A login since the read made another profile: it stands.
+	return s.writeIf(p, func(cur Profile) bool { return cur.KeyPrefix == keyPrefix })
 }
 
 // ListenSecretFor is the secret kept for the key of keyPrefix on device,
@@ -164,7 +165,11 @@ func (p Profile) ListenSecretFor(keyPrefix, device string) string {
 }
 
 // write replaces the file with p, 0600, whole: a new file renamed over it.
-func (s *Store) write(p Profile) error {
+func (s *Store) write(p Profile) error { return s.writeIf(p, nil) }
+
+// writeIf writes p unless still, given the file as it is just before the
+// rename, says no.
+func (s *Store) writeIf(p Profile, still func(Profile) bool) error {
 	b, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -173,6 +178,7 @@ func (s *Store) write(p Profile) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	removeStale(dir)
 	f, err := os.CreateTemp(dir, ".config-*.json")
 	if err != nil {
 		return err
@@ -189,7 +195,24 @@ func (s *Store) write(p Profile) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
+	if still != nil {
+		if cur, err := s.readProfile(); err != nil || !still(cur) {
+			return nil
+		}
+	}
 	return os.Rename(f.Name(), s.Path)
+}
+
+// removeStale removes a temporary file a novaro killed mid-write left (it
+// may hold a key): one older than a minute, so another novaro's write in
+// progress is left alone.
+func removeStale(dir string) {
+	old, _ := filepath.Glob(filepath.Join(dir, ".config-*.json"))
+	for _, f := range old {
+		if st, err := os.Stat(f); err == nil && time.Since(st.ModTime()) > time.Minute {
+			_ = os.Remove(f)
+		}
+	}
 }
 
 // Clear removes the key and the profile, whatever state they are in. A

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -623,5 +624,35 @@ func TestLoginPairsWhateverTheEnvironmentHolds(t *testing.T) {
 	}
 	if _, key, err := h.a.store.Load(); err != nil || key != "rk_test_in_ABCDEFGHrest" {
 		t.Fatalf("Load = %q, %v", key, err)
+	}
+}
+
+// login --api-key keeps the device named, so a CI runner whose host name
+// changes every job keeps one device and one listen secret.
+func TestLoginWithAKeyKeepsTheDeviceNamed(t *testing.T) {
+	h := newHarness(t)
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://x", "--device-name", "ci"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := h.a.store.Profile(); p.DeviceName != "ci" {
+		t.Errorf("device %q", p.DeviceName)
+	}
+}
+
+// --api-key "" is no key, not $NOVARO_API_KEY's.
+func TestAnEmptyAPIKeyFlagIsNotTheEnvironments(t *testing.T) {
+	h := newHarness(t)
+	t.Setenv("NOVARO_API_KEY", testKey)
+	if err := h.run(t, "login", "--api-key", "", "--api-base", "https://x"); err == nil {
+		t.Fatal("login kept $NOVARO_API_KEY for an empty --api-key")
+	}
+	if _, _, err := h.a.store.Load(); !errors.Is(err, config.ErrNotLoggedIn) {
+		t.Errorf("Load: %v", err)
+	}
+}
+
+func TestExitCodes(t *testing.T) {
+	if exitCode(os.Interrupt) != 130 || exitCode(syscall.SIGTERM) != 143 {
+		t.Errorf("%d %d", exitCode(os.Interrupt), exitCode(syscall.SIGTERM))
 	}
 }

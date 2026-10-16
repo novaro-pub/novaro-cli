@@ -404,3 +404,26 @@ func TestClip(t *testing.T) {
 		t.Errorf("%q", got)
 	}
 }
+
+// Ctrl-C on a network gone (a relay that never answers the close): listen
+// is out within a second or so, not the 5 s the close handshake allows.
+func TestCtrlCOnADeadNetworkIsQuick(t *testing.T) {
+	r := &relay{t: t}
+	r.scripts = []func(context.Context, *websocket.Conn, message){
+		func(ctx context.Context, conn *websocket.Conn, _ message) {
+			_ = writeJSON(ctx, conn, message{Type: "ready", Secret: "whsec_1"})
+			<-ctx.Done() // reads nothing: the close is never answered
+		},
+	}
+	api := httptest.NewServer(r)
+	defer api.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	start := time.Now()
+	err := Run(ctx, Config{URL: socketOf(t, api), Key: "k"}, &readyThen{recorder: &recorder{}, then: cancel})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v", err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("Ctrl-C took %s", d)
+	}
+}

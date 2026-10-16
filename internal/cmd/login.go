@@ -56,7 +56,7 @@ With --api-key, login keeps that key instead and opens no browser: for CI.`,
 			// The flag, not $NOVARO_API_KEY: an exported key is for the
 			// other commands, and login pairs in the browser.
 			if cmd.Flags().Changed("api-key") {
-				return a.saveKey()
+				return a.saveKey(device)
 			}
 			return a.pair(cmd.Context(), market, device, noBrowser)
 		},
@@ -69,7 +69,7 @@ With --api-key, login keeps that key instead and opens no browser: for CI.`,
 }
 
 // saveKey keeps --api-key as login's key.
-func (a *app) saveKey() error {
+func (a *app) saveKey(device string) error {
 	mode, keyMarket, ok := keyParts(a.apiKey)
 	if !ok {
 		return errors.New("--api-key is not an API key: it starts sk_test_, sk_live_ or rk_test_")
@@ -81,7 +81,12 @@ func (a *app) saveKey() error {
 	if err := checkBase(base); err != nil {
 		return err
 	}
-	p := config.Profile{APIBase: base, Market: keyMarket, KeyPrefix: prefixOf(a.apiKey), DeviceName: hostDevice()}
+	p := config.Profile{APIBase: base, Market: keyMarket, KeyPrefix: prefixOf(a.apiKey), DeviceName: device}
+	if p.DeviceName == "" {
+		p.DeviceName = hostDevice()
+	} else {
+		p.DeviceName = truncate(p.DeviceName, 64)
+	}
 	return a.save(p, a.apiKey)
 }
 
@@ -160,10 +165,9 @@ func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) e
 			continue
 		}
 		if poll.Status == "confirmed" && poll.APIKey != "" {
-			p := config.Profile{APIBase: base, Market: market, DeviceName: device, KeyPrefix: poll.KeyPrefix, KeyExpiresAt: poll.KeyExpiresAt}
-			if p.KeyPrefix == "" {
-				p.KeyPrefix = prefixOf(poll.APIKey)
-			}
+			// The prefix as novaro reads it from a key, which listen
+			// matches its kept secret by.
+			p := config.Profile{APIBase: base, Market: market, DeviceName: device, KeyPrefix: prefixOf(poll.APIKey), KeyExpiresAt: poll.KeyExpiresAt}
 			if err := a.save(p, poll.APIKey); err != nil {
 				return err
 			}
