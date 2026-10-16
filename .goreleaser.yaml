@@ -1,0 +1,111 @@
+# novaro's releases: one tag push makes every channel (release.yml).
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The release needs, as Actions secrets and variables:
+#   NOVARO_API_BASE      the API's address the binary talks to by default
+#   HOMEBREW_TAP_OWNER   the owner of the homebrew-tap and scoop-bucket repos
+#   TAP_GITHUB_TOKEN     a token that may push to both
+# Binaries and checksums are signed with cosign, keyless, by the workflow's
+# identity.
+version: 2
+
+project_name: novaro
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: novaro
+    main: .
+    binary: novaro
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .CommitDate }}
+      - -X novaro-cli/internal/cmd.DefaultAPIBase={{ .Env.NOVARO_API_BASE }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: novaro
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+    artifacts: checksum
+
+nfpms:
+  - id: packages
+    package_name: novaro
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: NovaroPay
+    homepage: https://github.com/{{ .Env.HOMEBREW_TAP_OWNER }}/novaro-cli
+    maintainer: NovaroPay
+    description: The NovaroPay command-line tool
+    license: Apache-2.0
+    formats: [deb, rpm]
+
+homebrew_casks:
+  - name: novaro
+    repository:
+      owner: "{{ .Env.HOMEBREW_TAP_OWNER }}"
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/{{ .Env.HOMEBREW_TAP_OWNER }}/novaro-cli
+    description: The NovaroPay command-line tool
+    license: Apache-2.0
+    commit_author:
+      name: NovaroPay
+      email: dev@novaropay.invalid
+    hooks:
+      post:
+        # The binary is not notarized: let macOS run it.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/novaro"]
+          end
+
+scoops:
+  - name: novaro
+    repository:
+      owner: "{{ .Env.HOMEBREW_TAP_OWNER }}"
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/{{ .Env.HOMEBREW_TAP_OWNER }}/novaro-cli
+    description: The NovaroPay command-line tool
+    license: Apache-2.0
+    commit_author:
+      name: NovaroPay
+      email: dev@novaropay.invalid
+
+dockers_v2:
+  - images: ["ghcr.io/{{ .Env.HOMEBREW_TAP_OWNER }}/novaro"]
+    tags: ["{{ .Version }}", latest]
+    platforms: [linux/amd64, linux/arm64]
+    labels:
+      org.opencontainers.image.source: https://github.com/{{ .Env.HOMEBREW_TAP_OWNER }}/novaro-cli
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: Apache-2.0
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude: ["^docs:", "^test:", "^ci:"]
