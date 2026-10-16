@@ -34,9 +34,12 @@ type Profile struct {
 	// Key is set only when no keychain took it.
 	Key string `json:"key,omitempty"`
 	// ListenSecret is the signing secret novaro listen last got with this
-	// login's key: what listen --print-secret prints without opening a
-	// session, which would replace a running listen's.
-	ListenSecret string `json:"listen_secret,omitempty"`
+	// login's key (ListenKeyPrefix) on this device (ListenDevice, "" for a
+	// CLI key, which names its own): what listen --print-secret prints
+	// without opening a session, which would replace a running listen's.
+	ListenSecret    string `json:"listen_secret,omitempty"`
+	ListenKeyPrefix string `json:"listen_key_prefix,omitempty"`
+	ListenDevice    string `json:"listen_device,omitempty"`
 }
 
 // Store reads and writes the profile and its key.
@@ -130,18 +133,34 @@ func (s *Store) Save(p Profile, key string) (inFile bool, err error) {
 	return inFile, nil
 }
 
-// SetListenSecret keeps the signing secret listen got, in the profile of
-// login's key.
-func (s *Store) SetListenSecret(secret string) error {
+// Profile reads the profile alone, not the key: no keychain prompt.
+func (s *Store) Profile() (Profile, error) { return s.readProfile() }
+
+// SetListenSecret keeps the signing secret listen got with the key of
+// keyPrefix on device, in login's profile, when that key is still login's
+// (a listen started before another login keeps its secret to itself).
+func (s *Store) SetListenSecret(keyPrefix, device, secret string) error {
 	p, err := s.readProfile()
 	if err != nil {
 		return err
 	}
-	if p.ListenSecret == secret {
+	if p.KeyPrefix != keyPrefix {
 		return nil
 	}
-	p.ListenSecret = secret
+	if p.ListenSecret == secret && p.ListenKeyPrefix == keyPrefix && p.ListenDevice == device {
+		return nil
+	}
+	p.ListenSecret, p.ListenKeyPrefix, p.ListenDevice = secret, keyPrefix, device
 	return s.write(p)
+}
+
+// ListenSecretFor is the secret kept for the key of keyPrefix on device,
+// "" for none.
+func (p Profile) ListenSecretFor(keyPrefix, device string) string {
+	if p.ListenSecret == "" || p.ListenKeyPrefix != keyPrefix || p.ListenDevice != device {
+		return ""
+	}
+	return p.ListenSecret
 }
 
 // write replaces the file with p, 0600, whole: a new file renamed over it.
@@ -173,27 +192,29 @@ func (s *Store) write(p Profile) error {
 	return os.Rename(f.Name(), s.Path)
 }
 
-// Clear removes the key and the profile, whatever state they are in: the
-// file first, so a key kept in it is gone even where the keychain cannot be
-// reached. A keychain that cannot be reached is an error only when the key
-// may be in it. Neither being there is not an error.
+// Clear removes the key and the profile, whatever state they are in. A
+// key in the keychain goes first: if the keychain cannot be reached, the
+// file stays, so logout can be run again. A key in the file, or a file
+// that cannot be read, goes with the file, and a keychain that cannot be
+// reached then only means there was nothing of novaro's in it to remove.
+// Neither being there is not an error.
 func (s *Store) Clear() error {
 	p, readErr := s.readProfile()
-	if err := os.Remove(s.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	err := s.Keyring.Delete(keyringService, keyringUser)
-	if err == nil || errors.Is(err, keyring.ErrNotFound) {
-		return nil
-	}
-	if readErr == nil && p.Key != "" {
-		// The key was in the file: no keychain took it.
-		return nil
-	}
 	if errors.Is(readErr, ErrNotLoggedIn) {
 		return nil
 	}
-	return fmt.Errorf("the OS keychain: %w", err)
+	if readErr == nil && p.Key == "" {
+		err := s.Keyring.Delete(keyringService, keyringUser)
+		if err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			return fmt.Errorf("the OS keychain: %w (the key is still there; run novaro logout again)", err)
+		}
+	} else {
+		_ = s.Keyring.Delete(keyringService, keyringUser)
+	}
+	if err := os.Remove(s.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Expired says whether p's key has expired at now.

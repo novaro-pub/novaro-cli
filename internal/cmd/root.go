@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,20 +53,40 @@ type app struct {
 // Execute runs novaro with the process's arguments and returns its exit
 // code.
 func Execute(b Build) int {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// The first SIGINT or SIGTERM ends the command's context, and the
+	// command winds down; a second one, the process, at once.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	var first atomic.Value
+	go func() {
+		sig := <-signals
+		first.Store(sig)
+		cancel()
+		<-signals
+		os.Exit(exitCode(sig))
+	}()
 	store, storeErr := config.Default()
 	a := &app{build: b, out: os.Stdout, errOut: os.Stderr, store: store, storeErr: storeErr, now: time.Now}
 	root := a.root()
 	root.SetArgs(os.Args[1:])
 	if err := root.ExecuteContext(ctx); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return 130
+		if sig, ok := first.Load().(os.Signal); ok && errors.Is(err, context.Canceled) {
+			return exitCode(sig)
 		}
 		fmt.Fprintln(os.Stderr, "novaro:", err)
 		return 1
 	}
 	return 0
+}
+
+// exitCode is a shell's for a process the signal ended: 128 + its number.
+func exitCode(sig os.Signal) int {
+	if sig == syscall.SIGTERM {
+		return 143
+	}
+	return 130
 }
 
 func (a *app) root() *cobra.Command {

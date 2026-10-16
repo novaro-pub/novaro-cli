@@ -53,7 +53,9 @@ you alone (login says which).
 With --api-key, login keeps that key instead and opens no browser: for CI.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if a.apiKey != "" {
+			// The flag, not $NOVARO_API_KEY: an exported key is for the
+			// other commands, and login pairs in the browser.
+			if cmd.Flags().Changed("api-key") {
 				return a.saveKey()
 			}
 			return a.pair(cmd.Context(), market, device, noBrowser)
@@ -79,7 +81,7 @@ func (a *app) saveKey() error {
 	if err := checkBase(base); err != nil {
 		return err
 	}
-	p := config.Profile{APIBase: base, Market: keyMarket, KeyPrefix: prefixOf(a.apiKey)}
+	p := config.Profile{APIBase: base, Market: keyMarket, KeyPrefix: prefixOf(a.apiKey), DeviceName: hostDevice()}
 	return a.save(p, a.apiKey)
 }
 
@@ -105,11 +107,7 @@ func (a *app) save(p config.Profile, key string) error {
 func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) error {
 	market = strings.ToLower(strings.TrimSpace(market))
 	if device == "" {
-		h, err := os.Hostname()
-		if err != nil || h == "" {
-			h = "novaro"
-		}
-		device = h
+		device = hostDevice()
 	}
 	device = truncate(device, 64)
 	if _, err := a.loadStore(); err != nil {
@@ -134,11 +132,10 @@ func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) e
 	}
 	fmt.Fprintln(a.out, "Waiting for confirmation…")
 
-	// The pairing lives 10 minutes; a start that names no end gets those.
-	deadline := a.now().Add(10 * time.Minute)
-	if pr.ExpiresAt > 0 {
-		deadline = time.Unix(pr.ExpiresAt, 0)
-	}
+	// The pairing lives 10 minutes, after which a poll is 404: the server
+	// says when it ended. The deadline here only stops a poll that never
+	// gets an answer, on this machine's clock, which may differ.
+	deadline := a.now().Add(11 * time.Minute)
 	path := "/cli/pairings/" + url.PathEscape(market) + "/" + url.PathEscape(pr.ID) + "/poll"
 	t := time.NewTicker(pollEvery)
 	defer t.Stop()
@@ -211,6 +208,15 @@ func prefixOf(key string) string {
 		return ""
 	}
 	return key[:i+1+8]
+}
+
+// hostDevice is this machine's name, as a device.
+func hostDevice() string {
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		h = "novaro"
+	}
+	return truncate(h, 64)
 }
 
 func truncate(s string, n int) string {

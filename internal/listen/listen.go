@@ -177,6 +177,10 @@ func Run(ctx context.Context, cfg Config, out Output) error {
 		if err == nil { // Once
 			return nil
 		}
+		// --print-secret asks once: a failure is its answer.
+		if cfg.Once {
+			return err
+		}
 		var e *Error
 		if errors.As(err, &e) && e.final() {
 			return err
@@ -259,7 +263,11 @@ func session(ctx context.Context, cfg Config, fwd *http.Client, out Output) (rea
 			case <-rctx.Done():
 				return
 			case <-ctx.Done():
+				// A close message, which the relay answers at once; on a
+				// network gone, not more than a second of waiting for it.
+				t := time.AfterFunc(time.Second, func() { _ = conn.CloseNow() })
 				_ = conn.Close(websocket.StatusNormalClosure, "")
+				t.Stop()
 				return
 			case <-t.C:
 				if time.Since(alive.Load().(time.Time)) > gap {
@@ -346,14 +354,17 @@ func forward(ctx context.Context, cfg Config, c *http.Client, m message) Event {
 		return ev
 	}
 	defer func() { _ = res.Body.Close() }()
-	b, _ := io.ReadAll(io.LimitReader(res.Body, bodyLimit))
+	// A character over the limit is read whole, so clip drops it rather
+	// than keep a broken one.
+	b, _ := io.ReadAll(io.LimitReader(res.Body, bodyLimit+utf8.UTFMax))
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
 	ev.Result.Status, ev.Result.Body = res.StatusCode, clip(b, bodyLimit)
 	return ev
 }
 
 // clip is the body as the relay keeps it: valid UTF-8 (JSON would write
-// each invalid byte as three), at most n bytes, cut between characters.
+// each invalid byte as three), at most n bytes, cut between characters. A
+// character the read cut, past n, is cut off with what follows it.
 func clip(b []byte, n int) string {
 	s := strings.ToValidUTF8(string(b), "\uFFFD")
 	if len(s) <= n {

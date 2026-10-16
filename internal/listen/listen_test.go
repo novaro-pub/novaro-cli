@@ -394,6 +394,12 @@ func TestClip(t *testing.T) {
 	if b, _ := json.Marshal(clip(bin, 2048)); len(b) > 2048+2 {
 		t.Errorf("binary as JSON: %d bytes", len(b))
 	}
+	// A read of the limit and a character more: the broken tail goes, no
+	// replacement character in its place.
+	cut := []byte(strings.Repeat("€", 700))[:2050] // 683 characters and 2 bytes of one
+	if got := clip(cut, 2048); len(got) != 2046 || strings.ContainsRune(got, utf8.RuneError) {
+		t.Errorf("a cut read: %d bytes, %q at its end", len(got), got[len(got)-3:])
+	}
 	if got := clip([]byte("ok"), 2048); got != "ok" {
 		t.Errorf("%q", got)
 	}

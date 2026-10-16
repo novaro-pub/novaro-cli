@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"novaro-cli/internal/config"
 	"novaro-cli/internal/listen"
 )
 
@@ -30,8 +31,9 @@ your endpoints' are, and POSTs each to --forward-to. Your server's answer
 goes back as the delivery's attempt: the portal shows it under the
 machine's "Local listener".
 
-The signing secret (whsec_…) is this machine's and stays the same across
-restarts; verify PSP-Signature with it as you would an endpoint's.
+The signing secret (whsec_…) is this machine's, for this key, and stays the
+same across restarts; verify PSP-Signature with it as you would an
+endpoint's.
 
   novaro listen --forward-to localhost:3000/webhooks
   novaro listen --events payment.succeeded,payment.failed --forward-to localhost:3000/webhooks`,
@@ -65,21 +67,31 @@ restarts; verify PSP-Signature with it as you would an endpoint's.
 			if latest {
 				apiVersion = "latest"
 			}
-			// Login's key is the one whose last secret the profile keeps.
+			// Login's key is the one whose last secret the profile keeps;
+			// a CLI key names its own device, a secret key this machine:
+			// the name login kept, so a host name that changes with the
+			// network does not make a new device with a new secret.
 			fromLogin := a.apiKey == ""
-			if printSecret && fromLogin {
-				// A listen opened only to read the secret would replace
-				// the session of a listen already running on this machine.
-				if store, err := a.loadStore(); err == nil {
-					if p, _, err := store.Load(); err == nil && p.ListenSecret != "" {
-						fmt.Fprintln(a.out, p.ListenSecret)
-						return nil
-					}
+			var profile config.Profile
+			if store, err := a.loadStore(); err == nil && fromLogin {
+				profile, _ = store.Profile()
+			}
+			if strings.HasPrefix(c.Key, "rk_") {
+				device = ""
+			} else if device == "" {
+				device = profile.DeviceName
+				if h, err := os.Hostname(); device == "" && err == nil {
+					device = truncate(h, 64)
 				}
 			}
-			if device == "" && !strings.HasPrefix(c.Key, "rk_") {
-				if h, err := os.Hostname(); err == nil {
-					device = truncate(h, 64)
+			prefix := prefixOf(c.Key)
+			if printSecret && fromLogin {
+				// A listen opened only to read the secret would replace
+				// the session of a listen running with the same key and
+				// device.
+				if secret := profile.ListenSecretFor(prefix, device); secret != "" {
+					fmt.Fprintln(a.out, secret)
+					return nil
 				}
 			}
 			cfg := listen.Config{
@@ -92,7 +104,7 @@ restarts; verify PSP-Signature with it as you would an endpoint's.
 					return
 				}
 				if store, err := a.loadStore(); err == nil {
-					_ = store.SetListenSecret(secret)
+					_ = store.SetListenSecret(prefix, device, secret)
 				}
 			}
 			var out listen.Output = &terminal{a: a, forwardTo: fwd, printSecret: printSecret, keep: keep}
@@ -109,7 +121,7 @@ restarts; verify PSP-Signature with it as you would an endpoint's.
 	f.BoolVarP(&latest, "latest", "l", false, "render events in the latest API version")
 	f.StringVarP(&headers, "headers", "H", "", `headers to add to each forwarded request: "Key: Value, Key2: Value2"`)
 	f.BoolVar(&skipVerify, "skip-verify", false, "accept any certificate of an https --forward-to")
-	f.BoolVar(&printSecret, "print-secret", false, "print the signing secret and exit (the one listen last got with login's key; else it opens a session, which replaces a listen running with the same key)")
+	f.BoolVar(&printSecret, "print-secret", false, "print the signing secret and exit: the one listen last got with login's key on this device, or else from a session it opens, which replaces a listen running with the same key and device")
 	f.StringVar(&format, "format", "", "json: print each event as a line of JSON")
 	f.StringVar(&device, "device-name", "", "the machine's name, with a secret key (a CLI key has its own)")
 	return cmd

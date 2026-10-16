@@ -523,14 +523,16 @@ func TestParseHeaders(t *testing.T) {
 	}
 }
 
-// --print-secret prints the secret listen last got with login's key and
-// opens no session, which would replace a running listen's.
+// --print-secret prints the secret listen last got with login's key on
+// this device, and opens no session, which would replace a running
+// listen's; a secret of another key or device is not that one's.
 func TestPrintSecretReadsTheLastOne(t *testing.T) {
 	h := newHarness(t)
-	if err := h.run(t, "login", "--api-key", "rk_test_in_ABCDEFGHrest", "--api-base", "https://unreachable.invalid"); err != nil {
+	const rk = "rk_test_in_ABCDEFGHrest"
+	if err := h.run(t, "login", "--api-key", rk, "--api-base", "https://unreachable.invalid"); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.a.store.SetListenSecret("whsec_kept"); err != nil {
+	if err := h.a.store.SetListenSecret(prefixOf(rk), "", "whsec_kept"); err != nil {
 		t.Fatal(err)
 	}
 	h.out.Reset()
@@ -539,5 +541,87 @@ func TestPrintSecretReadsTheLastOne(t *testing.T) {
 	}
 	if got := h.out.String(); got != "whsec_kept\n" {
 		t.Errorf("printed %q", got)
+	}
+	// A listen of an earlier login's key keeps its secret to itself.
+	if err := h.a.store.SetListenSecret("rk_test_in_OTHERKEY", "", "whsec_other"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := h.a.store.Profile(); p.ListenSecret != "whsec_kept" {
+		t.Errorf("another key's secret was kept: %+v", p)
+	}
+
+	// A secret key's: this machine's device, or another one named.
+	h = newHarness(t)
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://unreachable.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	p, key, _ := h.a.store.Load()
+	if p.DeviceName == "" {
+		t.Fatal("login kept no device name")
+	}
+	// The name login kept, not the host's now (one that changes with the
+	// network would make a new device with a new secret).
+	p.DeviceName = "kept-at-login"
+	if _, err := h.a.store.Save(p, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.store.SetListenSecret(prefixOf(testKey), p.DeviceName, "whsec_here"); err != nil {
+		t.Fatal(err)
+	}
+	h.out.Reset()
+	if err := h.run(t, "listen", "--print-secret"); err != nil || h.out.String() != "whsec_here\n" {
+		t.Errorf("this device: %q, %v", h.out, err)
+	}
+	h.out.Reset()
+	// Another device has no secret kept: it opens a session (here, to an
+	// address that does not answer) rather than print this one's.
+	if err := h.run(t, "listen", "--print-secret", "--device-name", "ci-box"); err == nil || strings.Contains(h.out.String(), "whsec_here") {
+		t.Errorf("another device: printed %q, %v", h.out, err)
+	}
+}
+
+// Logout where the keychain cannot be reached: a key kept in it stays,
+// and so does the file, to run logout again; a broken file goes.
+func TestLogoutWhenTheKeychainFails(t *testing.T) {
+	h := newHarness(t)
+	if err := h.run(t, "login", "--api-key", testKey, "--api-base", "https://x"); err != nil {
+		t.Fatal(err)
+	}
+	h.keyring.broken = true
+	if err := h.run(t, "logout"); err == nil || !strings.Contains(err.Error(), "run novaro logout again") {
+		t.Fatalf("logout: %v", err)
+	}
+	if _, err := os.Stat(h.a.store.Path); err != nil {
+		t.Fatalf("the file went with the key still in the keychain: %v", err)
+	}
+	if err := os.WriteFile(h.a.store.Path, []byte("{nonsense"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.run(t, "logout"); err != nil {
+		t.Fatalf("logout of a broken file, no keychain: %v", err)
+	}
+	if _, err := os.Stat(h.a.store.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the broken file is still there: %v", err)
+	}
+}
+
+// An exported NOVARO_API_KEY is for the other commands: login pairs in the
+// browser all the same.
+func TestLoginPairsWhateverTheEnvironmentHolds(t *testing.T) {
+	pollEvery = 5 * time.Millisecond
+	h := newHarness(t)
+	t.Setenv("NOVARO_API_KEY", "sk_live_in_0123456789abcdef")
+	var f fakeAPI
+	s := f.server(t, func(r request) (int, any) {
+		if r.Path == "/cli/pairings/in" {
+			return http.StatusOK, map[string]any{"id": "clp_in_1", "code": "C", "poll_secret": "p", "url": "u"}
+		}
+		return http.StatusOK, map[string]any{"status": "confirmed", "api_key": "rk_test_in_ABCDEFGHrest", "key_prefix": "rk_test_in_ABCDEFGH"}
+	})
+	if err := h.run(t, "login", "--api-base", s.URL, "--no-browser"); err != nil {
+		t.Fatal(err)
+	}
+	if _, key, err := h.a.store.Load(); err != nil || key != "rk_test_in_ABCDEFGHrest" {
+		t.Fatalf("Load = %q, %v", key, err)
 	}
 }
