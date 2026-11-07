@@ -12,20 +12,17 @@ novaro trigger payment.succeeded
 
 ## Install
 
-The names below are the release's owner's (`novaro`), set by `HOMEBREW_TAP_OWNER` in `.goreleaser.yaml`.
-
-
-- **macOS and Linux (Homebrew):** `brew install novaro/tap/novaro`
-- **Windows (Scoop):** `scoop bucket add novaro https://github.com/novaro/scoop-bucket` then `scoop install novaro`
-- **Debian, Ubuntu, Fedora:** the `.deb` and `.rpm` packages of a release
-- **Docker:** `docker run --rm -it ghcr.io/novaro/novaro version`
-- **Any system:** the archive for it from the releases page
+- **macOS and Linux (Homebrew):** `brew install novaro-pub/tap/novaro`
+- **Windows (Scoop):** `scoop bucket add novaro https://github.com/novaro-pub/scoop-bucket` then `scoop install novaro`
+- **Debian, Ubuntu, Fedora:** the `.deb` and `.rpm` packages of a [release](https://github.com/novaro-pub/novaro-cli/releases)
+- **Docker:** `docker run --rm -it ghcr.io/novaro-pub/novaro version`
+- **Any system:** the archive for it from the [releases page](https://github.com/novaro-pub/novaro-cli/releases)
 
 Every release's `checksums.txt`, which names every archive and package, is signed with [cosign](https://github.com/sigstore/cosign), keyless:
 
 ```sh
 cosign verify-blob --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/.+/novaro-cli/' \
+  --certificate-identity-regexp '^https://github.com/novaro-pub/novaro-cli/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
 ```
 
