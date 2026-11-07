@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -156,13 +157,13 @@ func TestLoginPairsInTheBrowserAndKeepsTheKeyInTheKeychain(t *testing.T) {
 		switch r.Path {
 		case "/cli/pairings/in":
 			return http.StatusOK, map[string]any{"id": "clp_in_1", "code": "ABCD-EFGH", "poll_secret": "ps_1",
-				"url": "http://portal/cli/pair?code=ABCD-EFGH", "expires_at": time.Now().Add(10 * time.Minute).Unix(), "device_name": "box"}
+				"url": "http://portal/cli/pair?code=ABCD-EFGH", "expires_at": strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10), "device_name": "box"}
 		case "/cli/pairings/in/clp_in_1/poll":
 			if polls++; polls < 3 {
 				return http.StatusOK, map[string]any{"status": "pending"}
 			}
 			return http.StatusOK, map[string]any{"status": "confirmed", "api_key": "rk_test_in_ABCDEFGHrest",
-				"key_prefix": "rk_test_in_ABCDEFGH", "key_expires_at": 1900000000}
+				"key_prefix": "rk_test_in_ABCDEFGH", "key_expires_at": "1900000000"}
 		}
 		return http.StatusNotFound, apiError("resource_missing", "no")
 	})

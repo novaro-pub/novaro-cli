@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,19 +24,38 @@ import (
 var pollEvery = 2 * time.Second
 
 type pairing struct {
-	ID         string `json:"id"`
-	Code       string `json:"code"`
-	PollSecret string `json:"poll_secret"`
-	URL        string `json:"url"`
-	ExpiresAt  int64  `json:"expires_at"`
-	DeviceName string `json:"device_name"`
+	ID         string      `json:"id"`
+	Code       string      `json:"code"`
+	PollSecret string      `json:"poll_secret"`
+	URL        string      `json:"url"`
+	ExpiresAt  unixSeconds `json:"expires_at"`
+	DeviceName string      `json:"device_name"`
+}
+
+// unixSeconds is a time in seconds since the Unix epoch, as the pairing
+// API answers it: the API writes its int64s as JSON strings ("1762531200"),
+// as protojson does; a JSON number is taken as well.
+type unixSeconds int64
+
+func (u *unixSeconds) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		*u = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("a time in seconds since the epoch: %q", b)
+	}
+	*u = unixSeconds(n)
+	return nil
 }
 
 type pairingPoll struct {
-	Status       string `json:"status"`
-	APIKey       string `json:"api_key"`
-	KeyPrefix    string `json:"key_prefix"`
-	KeyExpiresAt int64  `json:"key_expires_at"`
+	Status       string      `json:"status"`
+	APIKey       string      `json:"api_key"`
+	KeyPrefix    string      `json:"key_prefix"`
+	KeyExpiresAt unixSeconds `json:"key_expires_at"`
 }
 
 func (a *app) loginCmd() *cobra.Command {
@@ -167,7 +187,7 @@ func (a *app) pair(ctx context.Context, market, device string, noBrowser bool) e
 		if poll.Status == "confirmed" && poll.APIKey != "" {
 			// The prefix as novaro reads it from a key, which listen
 			// matches its kept secret by.
-			p := config.Profile{APIBase: base, Market: market, DeviceName: device, KeyPrefix: prefixOf(poll.APIKey), KeyExpiresAt: poll.KeyExpiresAt}
+			p := config.Profile{APIBase: base, Market: market, DeviceName: device, KeyPrefix: prefixOf(poll.APIKey), KeyExpiresAt: int64(poll.KeyExpiresAt)}
 			if err := a.save(p, poll.APIKey); err != nil {
 				return err
 			}
