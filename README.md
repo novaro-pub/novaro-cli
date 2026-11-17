@@ -33,7 +33,7 @@ cosign verify-blob --bundle checksums.txt.sigstore.json \
 | `novaro login` | Pairs novaro with your account in the browser: someone of the account allows it in the merchant portal, and novaro gets a CLI key (`rk_test_…`, test mode, 90 days), kept in the OS keychain, or, on a machine with none, in novaro's config file, readable by you alone. `--api-key sk_test_…` keeps that key instead, for CI. The key is sent only to the address login used, over https (or http to this machine). |
 | `novaro logout` | Forgets the key on this machine. |
 | `novaro listen` | Receives your test-mode events and POSTs each to `--forward-to`, signed as your endpoints' are; your server's answer is the delivery's attempt. `--events`, `--api-version`, `--latest`, `--headers`, `--skip-verify`, `--print-secret` (the secret listen last got with login's key on this device; else it opens a session, which replaces a running listen's), `--format json`. |
-| `novaro trigger <event>` | Makes the event happen with a test payment and a magic UTR. `--list`, `--override field=value`. |
+| `novaro trigger <event>` | Makes the event happen with a test payment confirmed with a magic UTR, with an ordinary one (which leaves it processing until its late-payment window, 24 h by default from when its time to pay runs out, closes and it fails), or not at all. `--list`, `--override field=value`. |
 | `novaro events list\|retrieve\|resend` | Reads your events (`GET /events`) and resends one to an endpoint (`POST /events/{id}/retry`). `--live` with `--api-key sk_live_…` for live mode. |
 | `novaro version`, `novaro completion` | The version; shell completion for bash, zsh, fish and PowerShell. |
 
