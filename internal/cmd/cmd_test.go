@@ -309,6 +309,90 @@ func TestTriggerProcessingUsesAnOrdinaryUTR(t *testing.T) {
 	}
 }
 
+// Each event's payment is confirmed with the UTR that makes it, and --list
+// and the output say what test mode does with it next.
+func TestTriggerConfirmsWithTheUTRThatMakesTheEvent(t *testing.T) {
+	ordinary := func(u string) bool { return len(u) == 12 && !strings.HasPrefix(u, "0") }
+	for _, c := range []struct {
+		event string
+		utr   func(string) bool // nil: no confirmation
+		then  []string          // what comes next, in so many words
+	}{
+		{"payment.created", nil, nil},
+		{"payment.processing", ordinary, []string{"stays processing", "fails when", "late-payment window (24 h by default", "time to pay runs out"}},
+		{"payment.succeeded", func(u string) bool { return u == "000000000001" }, []string{"succeeds within a second or two"}},
+		{"payment.failed", func(u string) bool { return u == "000000000003" }, []string{"fails about 5 s later"}},
+	} {
+		t.Run(c.event, func(t *testing.T) {
+			h := newHarness(t)
+			var f fakeAPI
+			s := f.server(t, func(r request) (int, any) {
+				switch r.Path {
+				case "/payments":
+					return http.StatusCreated, map[string]any{"id": "pay_in_1", "status": "awaiting_payer"}
+				case "/payments/pay_in_1/confirmations":
+					return http.StatusOK, map[string]any{"id": "pay_in_1", "status": "processing"}
+				}
+				return http.StatusNotFound, apiError("resource_missing", "no")
+			})
+			if err := h.run(t, "trigger", c.event, "--api-key", testKey, "--api-base", s.URL); err != nil {
+				t.Fatal(err)
+			}
+			calls := f.all()
+			if c.utr == nil {
+				if len(calls) != 1 {
+					t.Fatalf("calls %+v: want no confirmation", calls)
+				}
+			} else {
+				if len(calls) != 2 {
+					t.Fatalf("calls %+v: want a payment and its confirmation", calls)
+				}
+				if u, _ := calls[1].Body["utr"].(string); !c.utr(u) {
+					t.Fatalf("confirmed with %q", u)
+				}
+			}
+			fx := fixtures[c.event]
+			if c.utr == nil {
+				return
+			}
+			if fx.then == "" {
+				t.Fatal("confirmed, but says nothing of what comes next")
+			}
+			for _, w := range c.then {
+				if !strings.Contains(fx.then, w) {
+					t.Errorf("says %q of what comes next, want %q in it", fx.then, w)
+				}
+			}
+			if !strings.Contains(h.out.String(), fx.then) {
+				t.Errorf("output %q misses %q", h.out, fx.then)
+			}
+			if err := h.run(t, "trigger", "--list"); err != nil {
+				t.Fatal(err)
+			}
+			var line string
+			for l := range strings.Lines(h.out.String()) {
+				if strings.HasPrefix(l, c.event+" ") {
+					line = l
+				}
+			}
+			if !strings.Contains(line, fx.then) {
+				t.Errorf("--list line %q misses %q", line, fx.then)
+			}
+		})
+	}
+	long := strings.Join(strings.Fields(newHarness(t).a.triggerCmd().Long), " ")
+	for _, w := range []string{"magic one for payment.succeeded and payment.failed", "ordinary one for payment.processing", "24 h by default", "time to pay runs out", "fails"} {
+		if !strings.Contains(long, w) {
+			t.Errorf("help misses %q: %q", w, long)
+		}
+	}
+	for n, fx := range fixtures {
+		if fx.utr != "" && fx.then == "" {
+			t.Errorf("%s is confirmed but says nothing of what comes next", n)
+		}
+	}
+}
+
 func TestTriggerOnlyMakesWhatItKnows(t *testing.T) {
 	h := newHarness(t)
 	err := h.run(t, "trigger", "payment.expired", "--api-key", testKey)

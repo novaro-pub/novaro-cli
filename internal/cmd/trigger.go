@@ -16,9 +16,11 @@ import (
 )
 
 // fixture is how trigger makes an event happen: a test payment, confirmed
-// with a magic UTR or not at all.
+// with a magic UTR, an ordinary one or not at all.
 type fixture struct {
 	about string
+	// then is what test mode does with the payment next.
+	then string
 	// utr confirms the payment; "" leaves it awaiting the payer, and
 	// randomUTR an ordinary UTR of its own.
 	utr string
@@ -26,13 +28,25 @@ type fixture struct {
 
 const randomUTR = "random"
 
-// fixtures are the events trigger makes, with the magic UTRs of the test
-// environment that make them.
+// fixtures are the events trigger makes, with the UTRs of the test
+// environment that make them: an ordinary one moves nothing on its own
+// until the payment's late-payment window (24 h by default) closes.
 var fixtures = map[string]fixture{
-	"payment.created":    {about: "a test payment, awaiting the payer"},
-	"payment.processing": {about: "a test payment confirmed with a UTR; it succeeds about 5 s later", utr: randomUTR},
-	"payment.succeeded":  {about: "a test payment confirmed with the magic UTR 000000000001", utr: "000000000001"},
-	"payment.failed":     {about: "a test payment confirmed with the magic UTR 000000000003; it fails about 5 s later", utr: "000000000003"},
+	"payment.created": {about: "a test payment, awaiting the payer"},
+	"payment.processing": {about: "a test payment confirmed with an ordinary UTR", utr: randomUTR,
+		then: "it stays processing, and fails when its late-payment window (24 h by default, from when its time to pay runs out) closes"},
+	"payment.succeeded": {about: "a test payment confirmed with the magic UTR 000000000001", utr: "000000000001",
+		then: "it succeeds within a second or two"},
+	"payment.failed": {about: "a test payment confirmed with the magic UTR 000000000003", utr: "000000000003",
+		then: "it fails about 5 s later"},
+}
+
+// line is the fixture as --list shows it.
+func (f fixture) line() string {
+	if f.then == "" {
+		return f.about
+	}
+	return f.about + "; " + f.then
 }
 
 // currencies are the markets' currencies.
@@ -45,9 +59,13 @@ func (a *app) triggerCmd() *cobra.Command {
 		Use:   "trigger <event>",
 		Short: "Make a test event happen",
 		Long: `trigger makes the event happen in test mode the way your integration would:
-it creates a test payment with POST /payments and confirms it with a magic
-UTR, so the event and every one before it go out as usual, to your
-endpoints and to novaro listen.
+it creates a test payment with POST /payments and, except for
+payment.created, confirms it with a UTR: a magic one for payment.succeeded
+and payment.failed, an ordinary one for payment.processing, which leaves the
+payment processing until its late-payment window (24 h by default, from when
+its time to pay runs out) closes and it fails.
+The event and every one before it go out as usual, to your endpoints and to
+novaro listen.
 
   novaro trigger payment.succeeded
   novaro trigger payment.created --override amount=50000 --override metadata.order=42
@@ -65,7 +83,7 @@ endpoints and to novaro listen.
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if list {
 				for _, n := range names() {
-					fmt.Fprintf(a.out, "%-20s %s\n", n, fixtures[n].about)
+					fmt.Fprintf(a.out, "%-20s %s\n", n, fixtures[n].line())
 				}
 				return nil
 			}
@@ -102,7 +120,7 @@ endpoints and to novaro listen.
 				if err := c.Do(cmd.Context(), http.MethodPost, path, nil, idempotent(), map[string]string{"utr": utr}, &pay); err != nil {
 					return fmt.Errorf("confirm the payment: %w", err)
 				}
-				fmt.Fprintf(a.out, "Confirmed it with UTR %s (%s).\n", utr, pay.Status)
+				fmt.Fprintf(a.out, "Confirmed it with UTR %s (%s); %s.\n", utr, pay.Status, fx.then)
 			}
 			fmt.Fprintf(a.out, "Trigger succeeded: %s is on its way to your endpoints and novaro listen.\n", args[0])
 			return nil
